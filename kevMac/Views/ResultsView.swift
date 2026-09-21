@@ -82,28 +82,43 @@ struct ResultsView: View {
             Text(statusText)
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
-            if !kevManager.isServerReady && kevManager.errorMessage == nil {
+                .lineLimit(1)
+            if !kevManager.isServerReady && kevManager.missingModel == nil && kevManager.errorMessage == nil {
                 ProgressView()
                     .controlSize(.mini)
             }
-            if kevManager.errorMessage != nil && kevManager.isServerReady == false {
-                Button("Restart Engine") { kevManager.startServer() }
+            if let missing = kevManager.missingModel {
+                if kevManager.isDownloadingModel {
+                    ProgressView()
+                        .controlSize(.mini)
+                } else {
+                    Button("Download Model") { kevManager.downloadModel(missing) }
+                        .font(.system(size: 10, weight: .medium))
+                        .controlSize(.small)
+                }
+            } else if kevManager.errorMessage != nil && !kevManager.isServerReady {
+                Button("Restart Engine") { kevManager.startServer(model: kevManager.currentModel) }
                     .font(.system(size: 10))
                     .controlSize(.small)
             }
         }
         .frame(maxWidth: .infinity)
         .animation(.easeOut(duration: 0.2), value: kevManager.isServerReady)
+        .animation(.easeOut(duration: 0.2), value: kevManager.missingModel == nil)
     }
 
     private var statusText: String {
+        if let missing = kevManager.missingModel {
+            return kevManager.isDownloadingModel ? "Downloading \(missing.displayName)…" : "\(missing.displayName) isn't downloaded yet"
+        }
         if kevManager.errorMessage != nil && !kevManager.isServerReady { return "Engine error" }
         if !kevManager.isServerReady { return "Starting the decision engine…" }
         if kevManager.isWarmingUp { return "Warming up…" }
-        return "Engine ready"
+        return "Engine ready · \(kevManager.currentModel.displayName)"
     }
 
     private var statusColor: Color {
+        if kevManager.missingModel != nil && !kevManager.isDownloadingModel { return .orange }
         if kevManager.errorMessage != nil && !kevManager.isServerReady { return .red }
         if kevManager.isServerReady && !kevManager.isWarmingUp { return .green }
         return .orange

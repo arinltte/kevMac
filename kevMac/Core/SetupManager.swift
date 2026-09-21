@@ -14,6 +14,11 @@ class SetupManager: ObservableObject {
     var venvPython: URL { kevDir.appendingPathComponent(".venv/bin/python") }
     var cacheDir: URL { baseDir.appendingPathComponent("Cache") }
 
+    /// The model selection persists in UserDefaults; setup checks and downloads whatever model is selected.
+    var selectedModel: KevModel {
+        KevModel(rawValue: UserDefaults.standard.string(forKey: KevModel.storageKey) ?? "") ?? .defaultModel
+    }
+
     init() {
         checkIfAlreadyInstalled()
     }
@@ -21,15 +26,13 @@ class SetupManager: ObservableObject {
     // MARK: - Detection
 
     private func checkIfAlreadyInstalled() {
+        let model = selectedModel
         let kevPackage = kevDir.appendingPathComponent("kev").path
-        let baseWeights = cacheDir.appendingPathComponent("hub/models--Qwen--Qwen3-0.6B-Base").path
-        let adapterWeights = cacheDir.appendingPathComponent("hub/models--jaredpalmer--kev-0.6b").path
 
         if FileManager.default.fileExists(atPath: venvPython.path),
            FileManager.default.fileExists(atPath: kevPackage),
-           FileManager.default.fileExists(atPath: baseWeights),
-           FileManager.default.fileExists(atPath: adapterWeights) {
-            print("🚀 [SetupManager] Existing installation found. Skipping setup.")
+           model.isDownloaded(inBaseDir: baseDir) {
+            print("🚀 [SetupManager] Existing installation found (\(model.displayName)). Skipping setup.")
             isSetupComplete = true
         }
     }
@@ -116,9 +119,9 @@ class SetupManager: ObservableObject {
                 await updateStatus("Installing the decision engine dependencies (this may take a few minutes)...", progress: 0.5)
                 try await runShellCommand("cd '\(kevDir.path)' && '\(uvPath!)' sync --extra serve", extraEnv: uvEnvironment)
 
-                // 7. Model weights — downloaded automatically, no button needed
-                await updateStatus("Downloading the decision model weights (adapter, then the base model ~1.2 GB)...", progress: 0.7)
-                try await downloadModelWeights()
+                // 7. Model weights for the selected model — downloaded automatically, no button needed
+                await updateStatus("Downloading the \(selectedModel.displayName) weights (\(selectedModel.sizeHint), base model included)...", progress: 0.7)
+                try await downloadModel(selectedModel)
 
                 await updateStatus("Setup Complete!", progress: 1.0)
                 DispatchQueue.main.async {
@@ -132,9 +135,9 @@ class SetupManager: ObservableObject {
         }
     }
 
-    /// Pre-downloads the kev-0.6b adapter and its pinned Qwen base model into ~/.kevMac/Cache,
+    /// Pre-downloads the selected model's adapter and its pinned Qwen base into ~/.kevMac/Cache,
     /// so the decision engine starts fully offline and no button press is ever needed.
-    private func downloadModelWeights() async throws {
+    private func downloadModel(_ model: KevModel) async throws {
         let script = """
         import os
         import sys
@@ -143,24 +146,24 @@ class SetupManager: ObservableObject {
 
         from huggingface_hub import snapshot_download
 
-        print("Downloading kev-0.6b adapter and head weights...")
-        adapter = snapshot_download('jaredpalmer/kev-0.6b')
+        print("Downloading \(model.rawValue) adapter and head weights...")
+        adapter = snapshot_download('\(model.rawValue)')
 
         import torch
         meta = torch.load(os.path.join(adapter, 'head.pt'), map_location='cpu')
-        base = meta.get('base', 'Qwen/Qwen2.5-0.5B')
+        base = meta.get('base', '\(model.base)')
         revision = meta.get('base_revision')
 
-        print(f"Downloading the base model {base} (~1 GB)...")
+        print(f"Downloading the base model {base}...")
         if revision:
             snapshot_download(base, revision=revision)
         else:
             snapshot_download(base)
 
-        print("All model weights downloaded successfully.")
+        print("Model weights downloaded successfully.")
         """
 
-        let tempScriptPath = baseDir.appendingPathComponent("download_models.py").path
+        let tempScriptPath = baseDir.appendingPathComponent("download_model.py").path
         try script.write(toFile: tempScriptPath, atomically: true, encoding: .utf8)
         try await runShellCommand("'\(venvPython.path)' '\(tempScriptPath)' '\(cacheDir.path)'", extraEnv: ["HF_HOME": cacheDir.path])
         try? FileManager.default.removeItem(atPath: tempScriptPath)

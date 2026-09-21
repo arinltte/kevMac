@@ -146,7 +146,7 @@ private enum UpdateState {
 enum UpdateChecker {
     /// Current app version, read from the bundle ("CFBundleShortVersionString").
     static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0"
     }
 
     static let owner = "arinltte"

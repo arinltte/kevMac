@@ -52,8 +52,8 @@ struct SetupWizardView: View {
             // 3. What will be installed
             VStack(alignment: .leading, spacing: 10) {
                 installRow(icon: "chevron.down.circle", title: "uv + Python 3.13", detail: "Managed inside ~/.kevMac — no system changes")
-                installRow(icon: "cpu", title: "kev decision engine", detail: "LoRA adapter + pointer head on Qwen3-0.6B")
-                installRow(icon: "arrow.down.circle", title: "Model weights (~1.2 GB)", detail: "Downloaded automatically — no button needed")
+                installRow(icon: "cpu", title: "kev decision engine", detail: "LoRA adapter + pointer head on \(setupManager.selectedModel.base.replacingOccurrences(of: "Qwen/", with: ""))")
+                installRow(icon: "arrow.down.circle", title: "\(setupManager.selectedModel.displayName) weights (\(setupManager.selectedModel.sizeHint))", detail: "Downloaded automatically — no button needed")
             }
             .padding(16)
             .frame(width: 470)

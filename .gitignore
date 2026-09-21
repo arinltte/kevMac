@@ -23,6 +23,9 @@ Packages/
 # Private documentation & vendored repos — never publish
 private/
 
+# Local agent skills — kept off the repo (deleted from GitHub in v0.1.0)
+.agents/
+
 # Python runtime artifacts
 .venv/
 __pycache__/

@@ -37,6 +37,8 @@ struct MainView: View {
         .frame(minWidth: 1100, minHeight: 700)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                modelPicker
+
                 Menu {
                     ForEach(Preset.all) { preset in
                         Button(preset.name) { loadPreset(preset) }
@@ -60,7 +62,36 @@ struct MainView: View {
             if questions.isEmpty {
                 loadPreset(Preset.supportTriage)
             }
+            kevManager.startServer(model: appSettings.selectedModel)
         }
+        .onChange(of: appSettings.selectedModel) { _, newModel in
+            // Switching models restarts the engine on the new selection
+            kevManager.startServer(model: newModel)
+        }
+    }
+
+    // MARK: - Model picker
+
+    private var modelPicker: some View {
+        Menu {
+            Section("Supported models") {
+                ForEach(KevModel.allCases) { model in
+                    Button {
+                        appSettings.selectedModel = model
+                    } label: {
+                        // Already-downloaded models say so; the rest show the download size
+                        Text("\(model.displayName) — \(model.isDownloaded(inBaseDir: kevManager.baseDir) ? "downloaded" : model.sizeHint + " to download")")
+                    }
+                }
+            }
+            Section {
+                Text("\(appSettings.selectedModel.displayName) — \(appSettings.selectedModel.base.replacingOccurrences(of: "Qwen/", with: "")) · \(appSettings.selectedModel.accuracyHint) · serves in \(appSettings.selectedModel.needsBF16 ? "bf16" : "fp32") · \(appSettings.selectedModel.memoryHint)")
+                    .font(.system(size: 10))
+            }
+        } label: {
+            Label("Model: \(appSettings.selectedModel.displayName)", systemImage: "cpu")
+        }
+        .help("Choose the decision model")
     }
 
     // MARK: - Editor pane
