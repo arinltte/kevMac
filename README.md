@@ -39,6 +39,18 @@
 
 ## 🚀 Installation
 
+### Recommended
+
+Download the latest `.dmg` from the [Releases](https://github.com/arinltte/kevMac/releases/latest) page, open it, and drag **kevMac** to your Applications folder.
+
+### Gatekeeper
+
+If macOS blocks the app on first launch, run the following in Terminal:
+
+```bash
+xattr -rd com.apple.quarantine /Applications/kevMac.app
+```
+
 ### Build & run
 
 ```bash
