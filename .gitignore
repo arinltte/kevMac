@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# Xcode
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.moved-aside
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.build/
+Packages/
+
+# Private documentation & vendored repos — never publish
+private/
+
+# Python runtime artifacts
+.venv/
+__pycache__/
+*.pyc
+
+# App local runtime folder (models, venv, caches live here on the user's machine)
+.kevMac/
