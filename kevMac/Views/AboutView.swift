@@ -60,7 +60,7 @@ struct AboutView: View {
             .padding(.top, 10)
 
             VStack(spacing: 2) {
-                Text("Decision engine: kev-0.6b by [Jared Palmer](https://github.com/jaredpalmer/kev)")
+                Text("Developed by arinltte · arinltte00@gmail.com")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
                     .tint(appSettings.appTheme.accentColor)
@@ -146,7 +146,7 @@ private enum UpdateState {
 enum UpdateChecker {
     /// Current app version, read from the bundle ("CFBundleShortVersionString").
     static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.1"
     }
 
     static let owner = "arinltte"

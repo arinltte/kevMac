@@ -161,7 +161,9 @@ Contributions are welcome. Whether it's a bug report, a feature suggestion, a do
 
 Distributed under the MIT License. See `LICENSE` for more information.
 
-The decision engine is [kev](https://github.com/jaredpalmer/kev) by Jared Palmer (Apache-2.0); the model weights are on the [Hugging Face Hub](https://huggingface.co/jaredpalmer/kev-0.8b). The base models (Qwen3-0.6B-Base, Qwen3.5) carry the Qwen license.
+<p align="center">
+  <i>Logo by GUMO · https://www.instagram.com/gumoooo._/</i>
+</p>
 
 <p align="center">
   <i>Developed by arinltte · arinltte00@gmail.com</i>
