@@ -2,9 +2,10 @@
 //  AboutView.swift
 //  kevMac
 //
-//  About pane: app icon, name, version, and a "Check for Update" action that
-//  queries the GitHub releases API. If a release newer than the current version
-//  exists, the button becomes "Update Available" and opens the release page.
+//  About pane: app icon, name, version, a "Check for Update" action that queries the
+//  GitHub releases API, the live decision-engine card (Kev 1.0's /v1/models: backend,
+//  dtype, temperature, serving limit, prefix-cache stats) with an Update Engine action,
+//  and the theme picker.
 //
 
 import AppKit
@@ -12,6 +13,8 @@ import SwiftUI
 
 struct AboutView: View {
     @EnvironmentObject var appSettings: AppSettings
+    @EnvironmentObject var kevManager: KevManager
+    @EnvironmentObject var setupManager: SetupManager
 
     @State private var state: UpdateState = .idle
 
@@ -20,28 +23,32 @@ struct AboutView: View {
             Text("About")
                 .font(.system(size: 14, weight: .semibold))
 
-            Spacer()
+            Spacer(minLength: 8)
 
             Image(nsImage: NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath))
                 .resizable()
-                .frame(width: 64, height: 64)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .frame(width: 56, height: 56)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .shadow(color: .black.opacity(0.2), radius: 6, y: 2)
 
             Text("kevMac")
                 .font(.system(size: 13, weight: .bold))
-                .padding(.top, 12)
+                .padding(.top, 10)
 
             Text("Version \(UpdateChecker.currentVersion)")
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
-                .padding(.top, 3)
+                .padding(.top, 2)
 
             updateControl
-                .padding(.top, 18)
-                .frame(minHeight: 28)
+                .padding(.top, 10)
 
-            Spacer()
+            Divider().opacity(0.5)
+                .padding(.vertical, 10)
+
+            engineSection
+
+            Spacer(minLength: 8)
 
             Divider().opacity(0.5)
 
@@ -69,11 +76,102 @@ struct AboutView: View {
                     .foregroundColor(.secondary.opacity(0.7))
             }
             .multilineTextAlignment(.center)
-            .padding(.top, 10)
+            .padding(.top, 8)
         }
         .padding(14)
-        .frame(width: 270, height: 380)
+        .frame(width: 300, height: 560)
     }
+
+    // MARK: - Decision engine (the live /v1/models card + update action)
+
+    private var engineSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Decision engine")
+                .font(.system(size: 12, weight: .semibold))
+
+            VStack(alignment: .leading, spacing: 3) {
+                engineRow("Engine", value: setupManager.installedEngineStamp.map { "kev \($0.replacingOccurrences(of: "kev-", with: ""))" } ?? "pre-1.0 snapshot")
+
+                if let info = kevManager.engineInfo {
+                    engineRow("Serving", value: info.run ?? "—")
+                    engineRow("Backend", value: "\(info.backend ?? "?") · \(info.dtype ?? "?")")
+                    if let temperature = info.temperature {
+                        engineRow("Temperature", value: String(format: "%.2f", temperature))
+                    }
+                    if let released = info.releaseDate {
+                        engineRow("Released", value: released)
+                    }
+                    if let maxState = info.maxStateTokens {
+                        engineRow("Document limit", value: "\(maxState) tokens")
+                    }
+                    if let cache = info.prefixCache {
+                        engineRow("Prefix cache", value: "\(cache.cachedStates ?? 0) cached · \(cache.hits ?? 0) hits / \(cache.misses ?? 0) misses")
+                    }
+                } else if kevManager.isServerReady {
+                    engineRow("Serving", value: "older engine — no live card")
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.05))
+            .cornerRadius(8)
+
+            engineUpdateControl
+        }
+    }
+
+    private func engineRow(_ label: String, value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+            Spacer(minLength: 8)
+            Text(value)
+                .font(.system(size: 10).monospacedDigit())
+                .foregroundColor(.primary)
+                .lineLimit(1)
+        }
+    }
+
+    @ViewBuilder
+    private var engineUpdateControl: some View {
+        if setupManager.isUpdatingEngine {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text(setupManager.engineUpdateMessage ?? "Updating the engine…")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            .frame(maxWidth: .infinity)
+        } else if setupManager.needsEngineUpdate {
+            VStack(spacing: 4) {
+                Button {
+                    kevManager.stopServer()
+                    setupManager.updateEngine { _ in
+                        kevManager.startServer(model: kevManager.currentModel)
+                        kevManager.refreshStorageInfo()
+                    }
+                } label: {
+                    Label("Update Engine (kev 1.0 — MLX)", systemImage: "arrow.down.circle.fill")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+                .controlSize(.small)
+                Text(setupManager.engineUpdateMessage ?? "Brings the MLX backend, 65,536-token documents and pinned weights.")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+        } else {
+            Text(setupManager.installedEngineStamp.map { "Engine up to date (\($0))." } ?? "Engine not installed yet.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - App update check
 
     @ViewBuilder
     private var updateControl: some View {
@@ -146,7 +244,7 @@ private enum UpdateState {
 enum UpdateChecker {
     /// Current app version, read from the bundle ("CFBundleShortVersionString").
     static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.1"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.0"
     }
 
     static let owner = "arinltte"
