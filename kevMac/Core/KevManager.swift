@@ -342,14 +342,58 @@ class KevManager: ObservableObject {
 
     /// Removes one model's weights from the download cache — the safe cleanup path for
     /// models that are no longer used, so switching models never leaves duplicate storage
-    /// behind. Refuses the model the engine is currently serving; deletes the checkpoint
-    /// dir and its base dir (unless another cached kev model shares the base); only ever
-    /// deletes inside `~/.kevMac/Cache/hub`.
+    /// behind. Refuses the model the engine is currently serving. Removal goes through the
+    /// hub's own `hf cache rm` (it maintains the shared-blob refcounts that make the cache
+    /// content-deduplicated), with a plain directory delete as the fallback; the base repo
+    /// is removed with the checkpoint unless another cached kev model shares it.
     func removeDownloadedModel(_ model: KevModel) {
         guard model != currentModel else { return }
         let fm = FileManager.default
         let hubPath = hubDir.standardizedFileURL.path + "/"
 
+        // The hub CLI lives in the engine venv; it needs the same HF_HOME the engine uses.
+        // The CLI addresses repos with their namespace (model/<owner>/<name>).
+        let hfCLI = kevDir.appendingPathComponent(".venv/bin/hf").path
+        if fm.isExecutableFile(atPath: hfCLI) {
+            var targets = ["model/\(model.rawValue)"]
+            if !KevModel.baseIsShared(by: model, inBaseDir: baseDir) {
+                targets.append("model/\(model.base)")
+            }
+            let task = Process()
+            task.launchPath = "/bin/zsh"
+            task.arguments = ["-c", "'\(hfCLI)' cache rm --yes \(targets.map { "'\($0)'" }.joined(separator: " "))"]
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            env["HF_HOME"] = baseDir.appendingPathComponent("Cache").path
+            task.environment = env
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = pipe
+            let collected = NSMutableData()
+            pipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                collected.append(data)
+                if !data.isEmpty, let output = String(data: data, encoding: .utf8) {
+                    print("🧹 [KevManager] \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
+                }
+                if data.isEmpty { pipe.fileHandleForReading.readabilityHandler = nil }
+            }
+            task.terminationHandler = { [weak self] process in
+                pipe.fileHandleForReading.readabilityHandler = nil
+                DispatchQueue.main.async {
+                    if process.terminationStatus != 0, let output = String(data: collected as Data, encoding: .utf8), !output.isEmpty {
+                        self?.errorMessage = "Could not remove \(model.displayName) weights: \(output.prefix(160))"
+                    }
+                    self?.refreshStorageInfo()
+                }
+            }
+            do { try task.run() } catch {
+                DispatchQueue.main.async { self.errorMessage = "Could not start the removal: \(error.localizedDescription)" }
+            }
+            return
+        }
+
+        // Fallback for engines without the hub CLI: delete the repo directories directly.
         var doomed: [URL] = [model.weightsCacheDir(inBaseDir: baseDir)]
         if !KevModel.baseIsShared(by: model, inBaseDir: baseDir) {
             doomed.append(model.baseWeightsCacheDir(inBaseDir: baseDir))
