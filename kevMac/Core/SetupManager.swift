@@ -6,6 +6,9 @@ class SetupManager: ObservableObject {
     @Published var isInstalling = false
     @Published var statusMessage = "Ready for setup."
     @Published var progress: Double = 0.0
+    /// Engine-update state (the auto-check on launch surfaces these in the About pane).
+    @Published var isUpdatingEngine = false
+    @Published var engineUpdateMessage: String?
 
     /// Everything the app installs lives in this dedicated folder.
     let baseDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kevMac")
@@ -13,6 +16,16 @@ class SetupManager: ObservableObject {
     var kevDir: URL { baseDir.appendingPathComponent("kev") }
     var venvPython: URL { kevDir.appendingPathComponent(".venv/bin/python") }
     var cacheDir: URL { baseDir.appendingPathComponent("Cache") }
+    var tempDir: URL { baseDir.appendingPathComponent("Temp") }
+
+    /// The engine release kevMac pins. Kev 1.0 is the release that brings the MLX backend
+    /// for Apple Silicon (the Qwen3.5 hybrid checkpoints finally run fast), 65,536-token
+    /// documents with honest refusals, `@revision` pins and the rich `/v1/models` card.
+    /// Pinning the tarball to the tag (not `main`) means every install gets the same engine
+    /// — the pre-1.0 snapshot this app used to fetch silently truncated documents at
+    /// 8,192 tokens and crawls on the reference DeltaNet kernels.
+    static let engineTag = "kev-1.0"
+    static let engineTarballURL = "https://github.com/jaredpalmer/kev/archive/refs/tags/\(engineTag).tar.gz"
 
     /// The model selection persists in UserDefaults; setup checks and downloads whatever model is selected.
     var selectedModel: KevModel {
@@ -35,6 +48,23 @@ class SetupManager: ObservableObject {
             print("🚀 [SetupManager] Existing installation found (\(model.displayName)). Skipping setup.")
             isSetupComplete = true
         }
+    }
+
+    /// The installed engine's stamp (nil on the pre-1.0 snapshot, which was never stamped).
+    var installedEngineStamp: String? {
+        let path = kevDir.appendingPathComponent(".engine-tag").path
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        let tag = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return tag.isEmpty ? nil : tag
+    }
+
+    /// True when the engine is installed but frozen on an older snapshot — every install
+    /// from before this release is (the engine used to be fetched once from `main` and
+    /// never again). MainView auto-updates once on launch; the About pane offers it too.
+    var needsEngineUpdate: Bool {
+        FileManager.default.fileExists(atPath: venvPython.path) &&
+        FileManager.default.fileExists(atPath: kevDir.appendingPathComponent("kev").path) &&
+        installedEngineStamp != Self.engineTag
     }
 
     private func isInternetAvailable() async -> Bool {
@@ -96,14 +126,15 @@ class SetupManager: ObservableObject {
                     }
                 }
 
-                // 4. Fetch the kev engine (curl ships with macOS — no git required)
+                // 4. Fetch the kev engine, pinned to the kev-1.0 release (curl ships with
+                //    macOS — no git required). A fresh install is stamped right away; an
+                //    existing pre-1.0 snapshot is replaced so no install is left frozen.
                 if !FileManager.default.fileExists(atPath: kevDir.appendingPathComponent("kev").path) {
-                    await updateStatus("Fetching the kev decision engine...", progress: 0.2)
-                    let tarball = baseDir.appendingPathComponent("kev.tar.gz")
-                    try await runShellCommand("curl -L --fail --silent --show-error https://github.com/jaredpalmer/kev/archive/refs/heads/main.tar.gz -o '\(tarball.path)'")
-                    // --strip-components 1 drops the kev-main/ folder level, extracting straight into kev/
-                    try await runShellCommand("tar -xzf '\(tarball.path)' -C '\(kevDir.path)' --strip-components 1")
-                    try? FileManager.default.removeItem(at: tarball)
+                    await updateStatus("Fetching the kev \(Self.engineTag) decision engine...", progress: 0.2)
+                    try await fetchEngine()
+                } else if installedEngineStamp != Self.engineTag {
+                    await updateStatus("Updating the decision engine to kev \(Self.engineTag)...", progress: 0.2)
+                    try await fetchEngine(replaceExisting: true)
                 }
 
                 // 5. Python 3.13 — pinned explicitly, because torch ships no wheels for 3.14
@@ -116,12 +147,14 @@ class SetupManager: ObservableObject {
                     try await runShellCommand("cd '\(kevDir.path)' && '\(uvPath!)' venv --python 3.13", extraEnv: uvEnvironment)
                 }
 
-                await updateStatus("Installing the decision engine dependencies (this may take a few minutes)...", progress: 0.5)
+                await updateStatus("Installing the engine dependencies (this may take a few minutes)...", progress: 0.5)
                 try await runShellCommand("cd '\(kevDir.path)' && '\(uvPath!)' sync --extra serve", extraEnv: uvEnvironment)
 
-                // 7. Model weights for the selected model — downloaded automatically, no button needed
+                // 7. Model weights for the selected model — downloaded automatically, no
+                //    button needed. A fresh install always has the kev-1.0 engine, so the
+                //    download is pinned to @v1.0 exactly as the server will request it.
                 await updateStatus("Downloading the \(selectedModel.displayName) weights (\(selectedModel.sizeHint), base model included)...", progress: 0.7)
-                try await downloadModel(selectedModel)
+                try await downloadModel(selectedModel, pinned: true)
 
                 await updateStatus("Setup Complete!", progress: 1.0)
                 DispatchQueue.main.async {
@@ -135,37 +168,97 @@ class SetupManager: ObservableObject {
         }
     }
 
-    /// Pre-downloads the selected model's adapter and its pinned Qwen base into ~/.kevMac/Cache,
+    // MARK: - Engine update (the path every existing install takes once)
+
+    /// Replaces the engine snapshot with the pinned kev-1.0 tarball and re-syncs the
+    /// dependencies — existing virtual environments would not otherwise pick up `mlx-lm`,
+    /// and the MLX backend is the whole point of the update. The Python interpreter, the
+    /// virtual environment and the downloaded model weights are all preserved; the engine
+    /// process must be restarted by the caller afterwards.
+    func updateEngine(completion: ((Bool) -> Void)? = nil) {
+        guard !isUpdatingEngine else { return }
+        isUpdatingEngine = true
+        engineUpdateMessage = nil
+        print("🚀 [SetupManager] Updating the engine to \(Self.engineTag)...")
+
+        Task {
+            do {
+                guard let uvPath = ensureUVInstalled() else {
+                    throw NSError(domain: "SetupError", code: 1, userInfo: [NSLocalizedDescriptionKey: "uv was not found. Run setup again to reinstall."])
+                }
+                if !(await isInternetAvailable()) {
+                    throw NSError(domain: "SetupError", code: 2, userInfo: [NSLocalizedDescriptionKey: "Internet connection required."])
+                }
+
+                await setEngineUpdateMessage("Stopping the engine…")
+                // Only the listening engine process — never this app's own connections to it
+                try? await runShellCommand("lsof -ti:8009 -sTCP:LISTEN | xargs kill -9 2>/dev/null || true")
+
+                await setEngineUpdateMessage("Fetching the kev \(Self.engineTag) engine…")
+                try await fetchEngine(replaceExisting: true)
+
+                await setEngineUpdateMessage("Updating the engine dependencies (this may take a few minutes)…")
+                try await runShellCommand("cd '\(kevDir.path)' && '\(uvPath)' sync --extra serve", extraEnv: uvEnvironment)
+
+                await setEngineUpdateMessage("Engine updated to \(Self.engineTag).")
+                DispatchQueue.main.async {
+                    self.isUpdatingEngine = false
+                    self.engineUpdateMessage = "Engine updated to \(Self.engineTag)."
+                    completion?(true)
+                }
+            } catch {
+                print("❌ [SetupManager] Engine update failed: \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    self.isUpdatingEngine = false
+                    self.engineUpdateMessage = "Update failed — \(error.localizedDescription)"
+                    completion?(false)
+                }
+            }
+        }
+    }
+
+    /// Downloads the pinned engine tarball and swaps the engine directory's contents,
+    /// preserving the virtual environment. Stamps `.engine-tag` on success.
+    private func fetchEngine(replaceExisting: Bool = false) async throws {
+        let tarball = baseDir.appendingPathComponent("kev.tar.gz")
+        let extractDir = tempDir.appendingPathComponent("kev-engine")
+
+        if replaceExisting {
+            try? FileManager.default.removeItem(at: extractDir)
+            try? FileManager.default.removeItem(at: tarball)
+        }
+        try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
+
+        try await runShellCommand("curl -L --fail --silent --show-error \(Self.engineTarballURL) -o '\(tarball.path)'")
+        // --strip-components 1 drops the kev-kev-1.0/ folder level, extracting straight into the temp dir
+        try await runShellCommand("tar -xzf '\(tarball.path)' -C '\(extractDir.path)' --strip-components 1")
+
+        if replaceExisting {
+            // Clear the engine dir except the virtual environment, then move the new
+            // snapshot in — stale modules from the old snapshot must not linger.
+            try await runShellCommand("cd '\(kevDir.path)' && find . -mindepth 1 -maxdepth 1 ! -name '.venv' -exec rm -rf {} +")
+        }
+        // cp -R copies dotfiles too (mv would skip them in a glob)
+        try await runShellCommand("cp -R '\(extractDir.path)/.' '\(kevDir.path)/'")
+        try await runShellCommand("printf '%s' '\(Self.engineTag)' > '\(kevDir.appendingPathComponent(".engine-tag").path)'")
+
+        try? FileManager.default.removeItem(at: extractDir)
+        try? FileManager.default.removeItem(at: tarball)
+    }
+
+    private func setEngineUpdateMessage(_ message: String) async {
+        await MainActor.run { self.engineUpdateMessage = message }
+    }
+
+    // MARK: - Model weights
+
+    /// Pre-downloads the selected model's checkpoint and its pinned base into ~/.kevMac/Cache,
     /// so the decision engine starts fully offline and no button press is ever needed.
-    private func downloadModel(_ model: KevModel) async throws {
-        let script = """
-        import os
-        import sys
-
-        os.environ['HF_HOME'] = sys.argv[1]
-
-        from huggingface_hub import snapshot_download
-
-        print("Downloading \(model.rawValue) adapter and head weights...")
-        adapter = snapshot_download('\(model.rawValue)')
-
-        import torch
-        meta = torch.load(os.path.join(adapter, 'head.pt'), map_location='cpu')
-        base = meta.get('base', '\(model.base)')
-        revision = meta.get('base_revision')
-
-        print(f"Downloading the base model {base}...")
-        if revision:
-            snapshot_download(base, revision=revision)
-        else:
-            snapshot_download(base)
-
-        print("Model weights downloaded successfully.")
-        """
-
+    /// `pinned` must match what the engine will serve (see ModelDownload).
+    private func downloadModel(_ model: KevModel, pinned: Bool) async throws {
         let tempScriptPath = baseDir.appendingPathComponent("download_model.py").path
-        try script.write(toFile: tempScriptPath, atomically: true, encoding: .utf8)
-        try await runShellCommand("'\(venvPython.path)' '\(tempScriptPath)' '\(cacheDir.path)'", extraEnv: ["HF_HOME": cacheDir.path])
+        try ModelDownload.script(for: model, pinned: pinned).write(toFile: tempScriptPath, atomically: true, encoding: .utf8)
+        try await runShellCommand("'\(venvPython.path)' '\(tempScriptPath)' '\(baseDir.appendingPathComponent("Cache").path)'", extraEnv: ["HF_HOME": baseDir.appendingPathComponent("Cache").path])
         try? FileManager.default.removeItem(atPath: tempScriptPath)
     }
 

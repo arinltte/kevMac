@@ -40,9 +40,9 @@ struct kevMacApp: App {
                 MainView()
                     .environmentObject(kevManager)
                     .environmentObject(appSettings)
+                    .environmentObject(setupManager)
                     .onAppear {
                         appDelegate.kevManager = kevManager
-                        kevManager.startServer(model: appSettings.selectedModel)
                     }
             } else {
                 SetupWizardView(setupManager: setupManager)

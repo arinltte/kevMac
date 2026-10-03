@@ -48,6 +48,10 @@ struct ResultsView: View {
                         errorBanner(error)
                     }
 
+                    if kevManager.lastTruncated {
+                        truncationNotice
+                    }
+
                     let answered = questions.filter { kevManager.results[$0.id.uuidString] != nil }
                     if answered.isEmpty && kevManager.errorMessage == nil {
                         emptyState
@@ -114,7 +118,11 @@ struct ResultsView: View {
         if kevManager.errorMessage != nil && !kevManager.isServerReady { return "Engine error" }
         if !kevManager.isServerReady { return "Starting the decision engine…" }
         if kevManager.isWarmingUp { return "Warming up…" }
-        return "Engine ready · \(kevManager.currentModel.displayName)"
+        var text = "Engine ready · \(kevManager.currentModel.displayName)"
+        if let info = kevManager.engineInfo, let backend = info.backend {
+            text += " · \(backend)"
+        }
+        return text
     }
 
     private var statusColor: Color {
@@ -138,6 +146,22 @@ struct ResultsView: View {
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.red.opacity(0.1)))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.red.opacity(0.3), lineWidth: 1))
+    }
+
+    /// Only a server started with KEV_TRUNCATE_STATES=1 ever reports this (the default
+    /// engine refuses over-limit documents with a 422 instead). Honest when it happens.
+    private var truncationNotice: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "scissors")
+                .foregroundColor(.orange)
+            Text("Document truncated — the engine read only the first \(kevManager.lastUsage?.stateTokensUsed.map(String.init) ?? "\(kevManager.engineInfo?.maxStateTokens ?? 65_536)") tokens of \(kevManager.lastUsage?.stateTokens.map(String.init) ?? "the document").")
+                .font(.system(size: 12))
+                .foregroundColor(.primary)
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.1)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.orange.opacity(0.3), lineWidth: 1))
     }
 
     private var emptyState: some View {
@@ -205,9 +229,12 @@ struct ResultsView: View {
 struct ResultCard: View {
     let question: QuestionForm
     let answer: Answer
+    @EnvironmentObject var kevManager: KevManager
     @EnvironmentObject var appSettings: AppSettings
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var appeared = false
+
+    private var questionKey: String { question.id.uuidString }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -240,6 +267,10 @@ struct ResultCard: View {
                     )
                 }
             }
+
+            if answer.type == "choice" {
+                stabilityControl
+            }
         }
         .cardBackground(appSettings.appTheme, padding: 14)
         .opacity(appeared ? 1 : 0)
@@ -251,6 +282,70 @@ struct ResultCard: View {
                 withAnimation(.spring(response: 0.35, dampingFraction: 1.0)) { appeared = true }
             }
         }
+    }
+
+    // MARK: - Option-order stability (kev 1.0: /v1/systemone/permute)
+
+    /// Upstream's own honesty check: changing the order of a choice's options can change
+    /// the answer. This re-runs the question under six shuffled orders and reports whether
+    /// the winning option survives them.
+    @ViewBuilder
+    private var stabilityControl: some View {
+        switch kevManager.stability[questionKey] {
+        case nil:
+            Button {
+                kevManager.checkStability(questionID: questionKey)
+            } label: {
+                Label("Check stability", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(appSettings.appTheme.accentColor)
+            .disabled(!kevManager.isServerReady)
+
+        case .checking:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("Re-running under shuffled option orders…")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+
+        case .stable(let result):
+            HStack(spacing: 6) {
+                Image(systemName: result.argmaxStable ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                    .foregroundColor(result.argmaxStable ? .green : .orange)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(result.argmaxStable
+                         ? "Stable — every option order picks the same answer"
+                         : "Varies — the answer depends on the option order")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(result.argmaxStable ? .primary : .primary)
+                    Text("across \(result.runs.count) orders · largest swing \(maxSwing(result))")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+            }
+
+        case .failed(let message):
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundColor(.red)
+                Text(message)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                Button("Retry") { kevManager.checkStability(questionID: questionKey) }
+                    .font(.system(size: 10, weight: .medium))
+                    .buttonStyle(.plain)
+                    .foregroundColor(appSettings.appTheme.accentColor)
+            }
+        }
+    }
+
+    /// The widest max−min probability swing across the shuffled orders, in points.
+    private func maxSwing(_ result: PermuteResponse) -> String {
+        let spread = result.spread.values.max() ?? 0
+        return "\(Int((spread * 100).rounded())) points"
     }
 }
 

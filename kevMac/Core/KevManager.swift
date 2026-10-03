@@ -1,6 +1,13 @@
 import Foundation
 import Combine
 
+/// Per-choice-question stability check state (the /v1/systemone/permute call).
+enum StabilityState: Equatable {
+    case checking
+    case stable(PermuteResponse)
+    case failed(String)
+}
+
 class KevManager: ObservableObject {
     @Published var isServerReady = false
     @Published var isWarmingUp = false
@@ -18,16 +25,60 @@ class KevManager: ObservableObject {
     @Published var analyzedState: String = ""
     @Published var lastLatencyMS: Double?
     @Published var lastUsage: Usage?
+    /// True when the engine read only the first `max_state_tokens` of the document (only a
+    /// server started with KEV_TRUNCATE_STATES=1 ever truncates instead of refusing).
+    @Published var lastTruncated = false
+    /// The live engine card from GET /v1/models (backend, dtype, temperature, prefix-cache
+    /// stats…) — nil until the engine is ready, or on a pre-1.0 engine that returns none.
+    @Published var engineInfo: EngineCard?
+    /// Stability-check state per question id.
+    @Published var stability: [String: StabilityState] = [:]
+    /// Bumped whenever the download cache changes (download or removal) so pickers refresh.
+    @Published var cacheVersion = 0
+    /// Bytes each downloaded model occupies, computed off the main thread.
+    @Published var storage: [KevModel: Int64] = [:]
 
     private var serverProcess: Process?
     private var readinessTimer: Timer?
     private var hasWarmedUp = false
+    /// The request body of the last analysis, kept for the per-question stability check.
+    private var lastRequestBody: [String: Any]?
 
     let baseDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kevMac")
     private let port = 8009
 
     private var kevDir: URL { baseDir.appendingPathComponent("kev") }
     private var venvPython: URL { kevDir.appendingPathComponent(".venv/bin/python") }
+    private var hubDir: URL { baseDir.appendingPathComponent("Cache").appendingPathComponent("hub") }
+
+    // MARK: - Engine stamp
+
+    /// The engine snapshot tag stamped into `~/.kevMac/kev/.engine-tag` at extract time.
+    /// Absent on the pre-1.0 snapshot this app originally fetched from `main` — those
+    /// engines have no MLX backend, silently truncate at 8,192 tokens and reject `@revision`
+    /// pins in `--run` (they would fall back to `runs/smoke`).
+    var engineStamp: String? {
+        let path = kevDir.appendingPathComponent(".engine-tag").path
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        let tag = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return tag.isEmpty ? nil : tag
+    }
+
+    /// Whether the installed engine understands `--run repo@tag` (kev-1.0 added it; pins
+    /// must never be passed to an older engine — it would silently serve the smoke run).
+    var engineSupportsPins: Bool {
+        guard let stamp = engineStamp else { return false }
+        guard let version = Self.engineVersion(stamp) else { return false }
+        return version >= (1, 0)
+    }
+
+    /// "kev-1.0" → (1, 0); anything else → nil.
+    static func engineVersion(_ tag: String) -> (Int, Int)? {
+        guard let match = tag.range(of: #"^kev-(\d+)\.(\d+)$"#, options: .regularExpression) else { return nil }
+        let parts = tag[match].replacingOccurrences(of: "kev-", with: "").split(separator: ".")
+        guard parts.count == 2, let major = Int(parts[0]), let minor = Int(parts[1]) else { return nil }
+        return (major, minor)
+    }
 
     // MARK: - Server lifecycle
 
@@ -58,8 +109,11 @@ class KevManager: ObservableObject {
             return
         }
 
-        // The selected model must be downloaded before the engine can serve it offline
-        guard model.isDownloaded(inBaseDir: baseDir) else {
+        // The selected model must be downloaded before the engine can serve it offline.
+        // The cache check follows the pin the engine will serve: a kev-1.0 engine serves
+        // repo@v1.0 and needs refs/v1.0 cached; an older engine serves the moving main.
+        let pinned = engineSupportsPins
+        guard model.isDownloaded(inBaseDir: baseDir, pinned: pinned) else {
             DispatchQueue.main.async {
                 self.currentModel = model
                 self.isServerReady = false
@@ -75,11 +129,12 @@ class KevManager: ObservableObject {
             self.isWarmingUp = false
             self.missingModel = nil
             self.errorMessage = nil
+            self.engineInfo = nil
         }
 
         serverProcess = Process()
         serverProcess?.executableURL = URL(fileURLWithPath: venvPython.path)
-        serverProcess?.arguments = ["-m", "kev.serve", "--run", model.rawValue, "--port", String(port)]
+        serverProcess?.arguments = ["-m", "kev.serve", "--run", pinned ? model.pinnedRun : model.rawValue, "--port", String(port)]
         // `python -m kev.serve` needs the repo on sys.path — run from the engine folder
         serverProcess?.currentDirectoryURL = kevDir
 
@@ -88,8 +143,9 @@ class KevManager: ObservableObject {
         // Weights are pre-downloaded into ~/.kevMac/Cache during setup — run fully offline
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
-        // The Qwen3.5 models serve in bf16; the Qwen3-0.6B serves in fp32 (the default)
-        if model.needsBF16 { env["KEV_DTYPE"] = "bf16" }
+        // Kev 1.0 serves bf16 by default (MLX ignores the variable and is bf16 anyway);
+        // kev-0.6b keeps the fp32 exactness this app used to serve it with.
+        if let dtype = model.dtypeEnv { env["KEV_DTYPE"] = dtype }
         env["PATH"] = "/opt/homebrew/bin:" + (env["PATH"] ?? "")
         serverProcess?.environment = env
 
@@ -124,9 +180,27 @@ class KevManager: ObservableObject {
                             self.isServerReady = true
                             self.warmUpIfNeeded()
                         }
+                        self.refreshEngineInfo(data: data)
                     }
                 }
             }.resume()
+        }
+    }
+
+    /// Polls the Kev 1.0 rich model card: backend (mlx/torch), dtype, temperature, release
+    /// date, serving limit and prefix-cache stats — the live truth behind the About pane.
+    func refreshEngineInfo(data: Data? = nil) {
+        let url = URL(string: "http://127.0.0.1:\(port)/v1/models")!
+        let completion: (Data?) -> Void = { data in
+            guard let data = data,
+                  let decoded = try? JSONDecoder().decode(ModelsResponse.self, from: data),
+                  let card = decoded.models.first else { return }
+            DispatchQueue.main.async { self.engineInfo = card }
+        }
+        if let data = data {
+            completion(data)
+        } else {
+            URLSession.shared.dataTask(with: url) { data, _, _ in completion(data) }.resume()
         }
     }
 
@@ -168,10 +242,11 @@ class KevManager: ObservableObject {
         serverProcess = nil
     }
 
-    // MARK: - Model download
+    // MARK: - Model download & removal
 
-    /// Downloads one model's weights (adapter + its pinned base) into ~/.kevMac/Cache, then
-    /// restarts the engine on it. Used when the user selects a model that isn't downloaded yet.
+    /// Downloads one model's weights (checkpoint + its pinned base / tokenizer bits) into
+    /// ~/.kevMac/Cache, then restarts the engine on it. Used when the user selects a model
+    /// that isn't downloaded yet.
     func downloadModel(_ model: KevModel) {
         guard !isDownloadingModel else { return }
 
@@ -188,33 +263,11 @@ class KevManager: ObservableObject {
             return
         }
 
-        let script = """
-        import os
-        import sys
-
-        os.environ['HF_HOME'] = sys.argv[1]
-
-        from huggingface_hub import snapshot_download
-
-        print("Downloading \(model.rawValue) adapter and head weights...")
-        adapter = snapshot_download('\(model.rawValue)')
-
-        import torch
-        meta = torch.load(os.path.join(adapter, 'head.pt'), map_location='cpu')
-        base = meta.get('base', '\(model.base)')
-        revision = meta.get('base_revision')
-
-        print(f"Downloading the base model {base}...")
-        if revision:
-            snapshot_download(base, revision=revision)
-        else:
-            snapshot_download(base)
-
-        print("Model weights downloaded successfully.")
-        """
-
         let tempScriptPath = baseDir.appendingPathComponent("download_model.py").path
-        do { try script.write(toFile: tempScriptPath, atomically: true, encoding: .utf8) } catch {
+        do {
+            try ModelDownload.script(for: model, pinned: engineSupportsPins)
+                .write(toFile: tempScriptPath, atomically: true, encoding: .utf8)
+        } catch {
             DispatchQueue.main.async {
                 self.isDownloadingModel = false
                 self.errorMessage = "Could not prepare the download: \(error.localizedDescription)"
@@ -248,6 +301,7 @@ class KevManager: ObservableObject {
             DispatchQueue.main.async {
                 self?.isDownloadingModel = false
                 if process.terminationStatus == 0 {
+                    self?.refreshStorageInfo()
                     // Downloaded — bring the engine up on the new model
                     if let model = self?.currentModel {
                         self?.startServer(model: model)
@@ -264,6 +318,99 @@ class KevManager: ObservableObject {
                 self.errorMessage = "Could not start the download: \(error.localizedDescription)"
             }
         }
+    }
+
+    /// The models with weights cached right now.
+    var downloadedModels: [KevModel] {
+        KevModel.allCases.filter { $0.isDownloaded(inBaseDir: baseDir, pinned: engineSupportsPins) }
+    }
+
+    /// Computes each downloaded model's cache footprint off the main thread and publishes it.
+    func refreshStorageInfo() {
+        let baseDir = self.baseDir
+        DispatchQueue.global(qos: .utility).async {
+            var sizes: [KevModel: Int64] = [:]
+            for model in KevModel.allCases where model.isDownloaded(inBaseDir: baseDir, pinned: true) {
+                sizes[model] = model.storageSize(inBaseDir: baseDir)
+            }
+            DispatchQueue.main.async {
+                self.storage = sizes
+                self.cacheVersion += 1
+            }
+        }
+    }
+
+    /// Removes one model's weights from the download cache — the safe cleanup path for
+    /// models that are no longer used, so switching models never leaves duplicate storage
+    /// behind. Refuses the model the engine is currently serving. Removal goes through the
+    /// hub's own `hf cache rm` (it maintains the shared-blob refcounts that make the cache
+    /// content-deduplicated), with a plain directory delete as the fallback; the base repo
+    /// is removed with the checkpoint unless another cached kev model shares it.
+    func removeDownloadedModel(_ model: KevModel) {
+        guard model != currentModel else { return }
+        let fm = FileManager.default
+        let hubPath = hubDir.standardizedFileURL.path + "/"
+
+        // The hub CLI lives in the engine venv; it needs the same HF_HOME the engine uses.
+        // The CLI addresses repos with their namespace (model/<owner>/<name>).
+        let hfCLI = kevDir.appendingPathComponent(".venv/bin/hf").path
+        if fm.isExecutableFile(atPath: hfCLI) {
+            var targets = ["model/\(model.rawValue)"]
+            if !KevModel.baseIsShared(by: model, inBaseDir: baseDir) {
+                targets.append("model/\(model.base)")
+            }
+            let task = Process()
+            task.launchPath = "/bin/zsh"
+            task.arguments = ["-c", "'\(hfCLI)' cache rm --yes \(targets.map { "'\($0)'" }.joined(separator: " "))"]
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            env["HF_HOME"] = baseDir.appendingPathComponent("Cache").path
+            task.environment = env
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = pipe
+            let collected = NSMutableData()
+            pipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                collected.append(data)
+                if !data.isEmpty, let output = String(data: data, encoding: .utf8) {
+                    print("🧹 [KevManager] \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
+                }
+                if data.isEmpty { pipe.fileHandleForReading.readabilityHandler = nil }
+            }
+            task.terminationHandler = { [weak self] process in
+                pipe.fileHandleForReading.readabilityHandler = nil
+                DispatchQueue.main.async {
+                    if process.terminationStatus != 0, let output = String(data: collected as Data, encoding: .utf8), !output.isEmpty {
+                        self?.errorMessage = "Could not remove \(model.displayName) weights: \(output.prefix(160))"
+                    }
+                    self?.refreshStorageInfo()
+                }
+            }
+            do { try task.run() } catch {
+                DispatchQueue.main.async { self.errorMessage = "Could not start the removal: \(error.localizedDescription)" }
+            }
+            return
+        }
+
+        // Fallback for engines without the hub CLI: delete the repo directories directly.
+        var doomed: [URL] = [model.weightsCacheDir(inBaseDir: baseDir)]
+        if !KevModel.baseIsShared(by: model, inBaseDir: baseDir) {
+            doomed.append(model.baseWeightsCacheDir(inBaseDir: baseDir))
+        }
+        for dir in doomed {
+            let path = dir.standardizedFileURL.path
+            guard path.hasPrefix(hubPath), fm.fileExists(atPath: path) else { continue }
+            do {
+                try fm.removeItem(at: dir)
+                print("🧹 [KevManager] Removed \(path)")
+            } catch {
+                DispatchQueue.main.async {
+                    self.errorMessage = "Could not remove \(model.displayName) weights: \(error.localizedDescription)"
+                }
+            }
+        }
+        refreshStorageInfo()
     }
 
     // MARK: - Networking
@@ -284,7 +431,9 @@ class KevManager: ObservableObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.httpBody = payload
-        request.timeoutInterval = 120
+        // Long documents are servable on a Mac now: a first 65k-token read takes tens of
+        // seconds even on the fastest Apple Silicon (cached re-reads stay sub-second).
+        request.timeoutInterval = 600
 
         URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
@@ -298,7 +447,13 @@ class KevManager: ObservableObject {
             guard (200..<300).contains(httpResponse.statusCode), let data = data,
                   let decoded = try? JSONDecoder().decode(SystemOneResponse.self, from: data) else {
                 let detail = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-                completion(.failure("The engine returned an error (\(httpResponse.statusCode)). \(detail.prefix(200))"))
+                // Kev 1.0 refuses a document over the serving limit with a 422 that names
+                // the token count and the limit — turn it into an honest, tailored message.
+                if let over = OverLimitError.parse(statusCode: httpResponse.statusCode, detail: detail) {
+                    completion(.failure("The document is \(over.stateTokens) tokens, over the engine's \(over.limit)-token limit. Shorten it or split it across requests."))
+                } else {
+                    completion(.failure("The engine returned an error (\(httpResponse.statusCode)). \(detail.prefix(200))"))
+                }
                 return
             }
             completion(.success(decoded))
@@ -314,7 +469,9 @@ class KevManager: ObservableObject {
             self.isAnalyzing = true
             self.errorMessage = nil
             self.analyzedState = body["state"] as? String ?? ""
+            self.stability = [:]
         }
+        lastRequestBody = body
 
         post(path: "/v1/systemone", body: body) { [weak self] result in
             DispatchQueue.main.async {
@@ -325,10 +482,51 @@ class KevManager: ObservableObject {
                     self.results = response.answers
                     self.lastLatencyMS = response.latencyMs
                     self.lastUsage = response.usage
+                    self.lastTruncated = response.truncated ?? false
+                    self.refreshEngineInfo()
                 case .failure(let message):
                     self.errorMessage = message
                 }
             }
         }
+    }
+
+    // MARK: - Stability check (Kev 1.0: POST /v1/systemone/permute)
+
+    /// Re-runs one Choice question under six shuffled option orders and reports whether the
+    /// winning option survives them (upstream's own honesty check: changing option order can
+    /// change an answer). Requires the last analysis's request body.
+    func checkStability(questionID: String) {
+        guard let request = lastRequestBody else { return }
+        DispatchQueue.main.async { self.stability[questionID] = .checking }
+
+        let body: [String: Any] = ["request": request, "question": questionID, "n_perm": 6, "seed": 0]
+        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/systemone/permute"),
+              let payload = try? JSONSerialization.data(withJSONObject: body) else {
+            DispatchQueue.main.async { self.stability[questionID] = .failed("Could not build the request.") }
+            return
+        }
+
+        var request_ = URLRequest(url: url)
+        request_.httpMethod = "POST"
+        request_.setValue("application/json", forHTTPHeaderField: "content-type")
+        request_.httpBody = payload
+        request_.timeoutInterval = 600
+
+        URLSession.shared.dataTask(with: request_) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                guard error == nil,
+                      let httpResponse = response as? HTTPURLResponse,
+                      (200..<300).contains(httpResponse.statusCode),
+                      let data = data,
+                      let decoded = try? JSONDecoder().decode(PermuteResponse.self, from: data) else {
+                    let detail = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                    self.stability[questionID] = .failed("The engine returned an error (\((response as? HTTPURLResponse)?.statusCode ?? 0)). \(detail.prefix(120))")
+                    return
+                }
+                self.stability[questionID] = .stable(decoded)
+            }
+        }.resume()
     }
 }
