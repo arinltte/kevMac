@@ -144,7 +144,7 @@ class KevManager: ObservableObject {
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
         // Kev 1.0 serves bf16 by default (MLX ignores the variable and is bf16 anyway);
-        // kev-0.6b keeps the fp32 exactness this app used to serve it with.
+        // the Qwen3.5 LoRA trio pins it explicitly so a pre-1.0 engine stays on bf16 too.
         if let dtype = model.dtypeEnv { env["KEV_DTYPE"] = dtype }
         env["PATH"] = "/opt/homebrew/bin:" + (env["PATH"] ?? "")
         serverProcess?.environment = env
@@ -408,6 +408,59 @@ class KevManager: ObservableObject {
                 DispatchQueue.main.async {
                     self.errorMessage = "Could not remove \(model.displayName) weights: \(error.localizedDescription)"
                 }
+            }
+        }
+        refreshStorageInfo()
+    }
+
+    // MARK: - Retired-model cleanup (kev-0.6b was removed from the app in v0.3.1)
+
+    private static let retired06bCleanupKey = "retiredKev06bCacheCleaned"
+
+    /// One-time removal of the retired kev-0.6b's weights. v0.3.1 dropped the model from the
+    /// picker, so a cache left by older installs is dead weight the storage manager can no
+    /// longer see — this clears it through the hub's own `hf cache rm` (shared-blob
+    /// refcounts respected), falling back to deleting the app-owned cache directories.
+    func removeRetiredModelCachesIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: Self.retired06bCleanupKey) else { return }
+        UserDefaults.standard.set(true, forKey: Self.retired06bCleanupKey)
+
+        let retiredDirs = [
+            hubDir.appendingPathComponent("models--jaredpalmer--kev-0.6b"),
+            hubDir.appendingPathComponent("models--Qwen--Qwen3-0.6B-Base"),
+        ]
+        let fm = FileManager.default
+        guard retiredDirs.contains(where: { fm.fileExists(atPath: $0.path) }) else { return }
+        print("🧹 [KevManager] Removing retired kev-0.6b weights from the cache…")
+
+        let hfCLI = kevDir.appendingPathComponent(".venv/bin/hf").path
+        if fm.isExecutableFile(atPath: hfCLI) {
+            let task = Process()
+            task.launchPath = "/bin/zsh"
+            task.arguments = ["-c", "'\(hfCLI)' cache rm --yes 'model/jaredpalmer/kev-0.6b' 'model/Qwen/Qwen3-0.6B-Base'"]
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            env["HF_HOME"] = baseDir.appendingPathComponent("Cache").path
+            task.environment = env
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = pipe
+            pipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                if !data.isEmpty, let output = String(data: data, encoding: .utf8) {
+                    print("🧹 [KevManager] \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
+                }
+                if data.isEmpty { pipe.fileHandleForReading.readabilityHandler = nil }
+            }
+            task.terminationHandler = { _ in pipe.fileHandleForReading.readabilityHandler = nil }
+            try? task.run()
+        } else {
+            // No hub CLI (engine not installed): delete the app-owned directories directly.
+            let hubPath = hubDir.standardizedFileURL.path + "/"
+            for dir in retiredDirs {
+                let path = dir.standardizedFileURL.path
+                guard path.hasPrefix(hubPath), fm.fileExists(atPath: path) else { continue }
+                try? fm.removeItem(at: dir)
             }
         }
         refreshStorageInfo()

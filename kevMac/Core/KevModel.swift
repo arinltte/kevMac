@@ -1,15 +1,13 @@
 import Foundation
 
-/// The supported kev checkpoints — the Kev 1.0 family (0.8B / 4B / 9B / 27B, pinned to the
-/// upstream `@v1.0` Hub tags) plus the Qwen3-0.6B the app originally shipped with, now
-/// retired upstream to "previous generation" and kept only for continuity. Selection is
-/// dynamic: the engine serves whichever model is selected, and only that model's weights
-/// are downloaded.
+/// The supported kev checkpoints — the Kev 1.0 family (0.8B / 4B / 9B / 27B), pinned to the
+/// upstream `@v1.0` Hub tags. The Qwen3-0.6B the app originally shipped with was retired
+/// upstream to "previous generation" and is removed from kevMac entirely (v0.3.1): it is no
+/// longer selectable, and leftover caches from older installs are cleaned up automatically.
+/// Selection is dynamic: the engine serves whichever model is selected, and only that
+/// model's weights are downloaded.
 enum KevModel: String, CaseIterable, Identifiable {
-    /// The model the app originally shipped with — kept for continuity. Retired upstream
-    /// ("previous generation", no longer developed), so it serves unpinned.
-    case kev06b = "jaredpalmer/kev-0.6b"
-    /// The smallest current model; replaces the 0.6B on the Qwen3.5 base.
+    /// The smallest current model; the default.
     case kev08b = "jaredpalmer/kev-0.8b"
     case kev4b = "jaredpalmer/kev-4b"
     case kev9b = "jaredpalmer/kev-9b"
@@ -20,7 +18,7 @@ enum KevModel: String, CaseIterable, Identifiable {
 
     static let storageKey = "selectedModel"
 
-    /// The default selection: the latest small model (the Qwen3.5-0.8B the 0.6B was replaced by).
+    /// The default selection: the latest small model.
     static let defaultModel: KevModel = .kev08b
 
     var displayName: String {
@@ -29,7 +27,6 @@ enum KevModel: String, CaseIterable, Identifiable {
 
     var base: String {
         switch self {
-        case .kev06b: return "Qwen/Qwen3-0.6B-Base"
         case .kev08b: return "Qwen/Qwen3.5-0.8B-Base"
         case .kev4b: return "Qwen/Qwen3.5-4B-Base"
         case .kev9b: return "Qwen/Qwen3.5-9B-Base"
@@ -39,20 +36,18 @@ enum KevModel: String, CaseIterable, Identifiable {
 
     // MARK: - Kev 1.0 pinning
 
-    /// The Hub tag every Kev 1.0 repo carries. kev-0.6b predates the versioned family and
-    /// has no `v1.0` tag, so it serves unpinned (it is retired — its `main` no longer moves).
+    /// The Hub tag every Kev 1.0 repo carries. Passing the pin matters: upstream moved
+    /// `kev-9b`'s `main` to v2 weights on 2026-09-30, and kevMac must not silently serve
+    /// "whatever was cached". Only pass when the engine understands `@revision` (see
+    /// `KevManager.engineSupportsPins`) — the pre-1.0 engine would reject the pin and
+    /// silently fall back to `runs/smoke`.
     var pin: String? {
         switch self {
-        case .kev06b: return nil
         case .kev08b, .kev4b, .kev9b, .kev27b: return "v1.0"
         }
     }
 
-    /// The `--run` / `snapshot_download` specifier: `repo@v1.0` when pinned. Passing the pin
-    /// matters: upstream moved `kev-9b`'s `main` to v2 weights on 2026-09-30, and kevMac must
-    /// not silently serve "whatever was cached". Only pass when the engine understands
-    /// `@revision` (see `KevManager.engineSupportsPins`) — the pre-1.0 engine would reject
-    /// the pin and silently fall back to `runs/smoke`.
+    /// The `--run` / `snapshot_download` specifier: `repo@v1.0` when pinned.
     var pinnedRun: String {
         pin.map { "\(rawValue)@\($0)" } ?? rawValue
     }
@@ -64,28 +59,21 @@ enum KevModel: String, CaseIterable, Identifiable {
         self == .kev27b
     }
 
-    /// True for the model the app shipped with — labeled "previous generation" in the picker.
-    var isLegacy: Bool {
-        self == .kev06b
-    }
-
     // MARK: - Serving metadata (Kev 1.0 cards)
 
     /// The dtype env the engine should be started with. Kev 1.0 serves bf16 by default on
-    /// every GPU/Mac (MLX ignores the variable); kev-0.6b keeps fp32 for the exactness the
-    /// app used to serve it with.
+    /// every GPU/Mac (MLX ignores the variable); the Qwen3.5 LoRA trio sets it explicitly so
+    /// a pre-1.0 engine still serves bf16, and the full-weight 27B loads as stored.
     var dtypeEnv: String? {
         switch self {
-        case .kev06b: return "fp32"
         case .kev08b, .kev4b, .kev9b: return "bf16"
-        case .kev27b: return nil   // loads as stored (bf16); nothing to pin
+        case .kev27b: return nil
         }
     }
 
     /// Approximate Hub-weight download size.
     var sizeHint: String {
         switch self {
-        case .kev06b: return "~1.2 GB"
         case .kev08b: return "~1.6 GB"
         case .kev4b: return "~8 GB"
         case .kev9b: return "~18 GB"
@@ -97,11 +85,10 @@ enum KevModel: String, CaseIterable, Identifiable {
     /// fit a 32 GB M5; the 27B is expected to need a 96–128 GB Mac and is unmeasured upstream).
     var memoryHint: String {
         switch self {
-        case .kev06b: return "~3.5 GB RAM"
         case .kev08b: return "~2 GB RAM"
         case .kev4b: return "~9–13 GB RAM"
-        case .kev9b: return "19 GB+ RAM · needs a 48 GB+ Mac"
-        case .kev27b: return "51 GB+ RAM · needs a 96–128 GB Mac"
+        case .kev9b: return "19 GB+ RAM · 48 GB+ Mac recommended"
+        case .kev27b: return "51 GB+ RAM · 96–128 GB Mac expected"
         }
     }
 
@@ -115,7 +102,6 @@ enum KevModel: String, CaseIterable, Identifiable {
     /// to "your own questions") plus the chance-corrected breadth-v1 index.
     var accuracyHint: String {
         switch self {
-        case .kev06b: return "previous generation"
         case .kev08b: return "0.697 new-source"
         case .kev4b: return "0.838 new-source"
         case .kev9b: return "0.852 new-source"
@@ -123,26 +109,26 @@ enum KevModel: String, CaseIterable, Identifiable {
         }
     }
 
-    // MARK: - RAM gating (Kev 1.0 cards: 9B did not fit a 32 GB M5; 27B is expected 96–128 GB)
+    // MARK: - Experimental sizes & RAM guidance
+
+    /// Kev 1.0's own cards leave the Mac path at these sizes unmeasured: the 9B did not fit
+    /// a 32 GB M5 (the only upstream datapoint), and the 27B is expected — not yet run — to
+    /// need a 96–128 GB Mac. They stay selectable and downloadable for users who want them,
+    /// but the picker marks them experimental and names the RAM they realistically need.
+    var isExperimental: Bool {
+        switch self {
+        case .kev08b, .kev4b: return false
+        case .kev9b, .kev27b: return true
+        }
+    }
 
     /// The Mac this model realistically needs.
     var recommendedRAMGB: Int {
         switch self {
-        case .kev06b, .kev08b: return 8
+        case .kev08b: return 8
         case .kev4b: return 32
         case .kev9b: return 48
         case .kev27b: return 96
-        }
-    }
-
-    /// Whether the picker refuses the model below `recommendedRAMGB` (9B genuinely cannot
-    /// load below it; 27B is unmeasured upstream — warn hard) or merely warns (4B can still
-    /// serve short documents on a 16 GB Mac).
-    var isRAMGated: Bool {
-        switch self {
-        case .kev06b, .kev08b: return false
-        case .kev4b: return false
-        case .kev9b, .kev27b: return true
         }
     }
 
@@ -150,7 +136,9 @@ enum KevModel: String, CaseIterable, Identifiable {
         Int((ProcessInfo.processInfo.physicalMemory + 500_000_000) / 1_000_000_000)
     }
 
-    /// True when this Mac has enough physical RAM to serve the model.
+    /// True when this Mac has the recommended physical RAM to serve the model comfortably.
+    /// Below it a model still loads (weights map lazily) but serves by swapping — on a 16 GB
+    /// Mac the 9B took ~155 s per request in testing — so the picker warns rather than hides.
     var fitsInRAM: Bool {
         Self.physicalRAMGB >= recommendedRAMGB
     }
@@ -190,7 +178,7 @@ enum KevModel: String, CaseIterable, Identifiable {
     // MARK: - Storage accounting (unused-model cleanup)
 
     /// Bytes this model occupies in the download cache (checkpoint + base), for the storage
-    /// manager. Directory sizes are walked lazily and cached briefly by the caller.
+    /// manager.
     func storageSize(inBaseDir baseDir: URL) -> Int64 {
         let fm = FileManager.default
         var total: Int64 = 0

@@ -25,7 +25,9 @@ struct AboutView: View {
 
             Spacer(minLength: 8)
 
-            Image(nsImage: NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath))
+            // From the compiled asset catalog — the bundle path's LaunchServices icon can be
+            // a stale cached one for a rebuilt app, which made About show an old logo.
+            Image(nsImage: aboutIcon)
                 .resizable()
                 .frame(width: 56, height: 56)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -80,6 +82,13 @@ struct AboutView: View {
         }
         .padding(14)
         .frame(width: 300, height: 560)
+    }
+
+    // MARK: - Icon (the compiled asset catalog is the source of truth)
+
+    private var aboutIcon: NSImage {
+        NSImage(named: "AppIcon")
+            ?? NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath)
     }
 
     // MARK: - Decision engine (the live /v1/models card + update action)
@@ -244,7 +253,7 @@ private enum UpdateState {
 enum UpdateChecker {
     /// Current app version, read from the bundle ("CFBundleShortVersionString").
     static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.0"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.1"
     }
 
     static let owner = "arinltte"

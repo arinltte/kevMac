@@ -3,7 +3,7 @@ import Foundation
 /// The Python weight-download script, shared by `SetupManager` (first-run setup) and
 /// `KevManager` (on-demand downloads). It mirrors upstream's loader rule (`kev/checkpoint.py`):
 ///
-/// - **LoRA checkpoints** (0.6b/0.8b/4b/9b): download the adapter, then the base at the exact
+/// - **LoRA checkpoints** (0.8b/4b/9b): download the adapter, then the base at the exact
 ///   `base_revision` `head.pt` names — that is what the engine loads offline.
 /// - **Full-weight checkpoints** (27b): no `adapter_config.json` — the whole bf16 backbone ships
 ///   inside the checkpoint. Downloading the base's weights too would double the disk cost for
@@ -16,7 +16,7 @@ import Foundation
 /// caller decides `pinned` and must keep download and serve in agreement.
 enum ModelDownload {
     static func script(for model: KevModel, pinned: Bool) -> String {
-        // `None` when unpinned (kev-0.6b, or a pre-1.0 engine that cannot serve pins); 'v1.0' otherwise
+        // `None` when a pre-1.0 engine that cannot serve pins is installed; 'v1.0' otherwise
         let revisionLiteral = pinned && model.pin != nil ? "'\(model.pin ?? "v1.0")'" : "None"
         return """
         import os

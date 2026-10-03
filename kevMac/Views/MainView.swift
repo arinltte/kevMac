@@ -45,7 +45,7 @@ struct MainView: View {
                         Button(preset.name) { loadPreset(preset) }
                     }
                 } label: {
-                    Label("Examples", systemImage: "square.grid.2x4")
+                    Label("Examples", systemImage: "square.grid.2x2")
                 }
                 .help("Load an example from the kev playground")
 
@@ -63,6 +63,7 @@ struct MainView: View {
             if questions.isEmpty {
                 loadPreset(Preset.supportTriage)
             }
+            kevManager.removeRetiredModelCachesIfNeeded()
             kevManager.refreshStorageInfo()
             launchEngine()
         }
@@ -100,7 +101,6 @@ struct MainView: View {
                     } label: {
                         Text(pickerLabel(for: model))
                     }
-                    .disabled(model.isRAMGated && !model.fitsInRAM)
                     .help(pickerHelp(for: model))
                 }
             }
@@ -139,24 +139,27 @@ struct MainView: View {
         .help("Choose the decision model")
     }
 
-    /// One row of the model list: download state, size, and the RAM/legacy notes.
+    /// One row of the model list: download state, size, and the experimental/RAM notes.
+    /// Every model is selectable — the big sizes are marked experimental instead of hidden,
+    /// because they still load (weights map lazily) and a user with the RAM should have them.
     private func pickerLabel(for model: KevModel) -> String {
         var parts = [model.displayName]
-        if model.isLegacy { parts.append("previous generation") }
+        if model.isExperimental { parts.append("experimental") }
         let downloaded = model.isDownloaded(inBaseDir: kevManager.baseDir, pinned: kevManager.engineSupportsPins)
         parts.append(downloaded ? "downloaded" : "\(model.sizeHint) to download")
-        if model.isRAMGated && !model.fitsInRAM {
-            parts.append("needs a \(model.recommendedRAMGB)+ GB Mac")
-        } else if !model.fitsInRAM {
-            parts.append("\(model.recommendedRAMGB) GB Mac recommended")
+        if !model.fitsInRAM {
+            parts.append("\(model.recommendedRAMGB)+ GB Mac recommended")
         }
         return parts.joined(separator: " — ")
     }
 
     private func pickerHelp(for model: KevModel) -> String {
         var help = "\(model.base.replacingOccurrences(of: "Qwen/", with: "")) · \(model.accuracyHint) · \(model.memoryHint)"
+        if model.isExperimental {
+            help += " — experimental: serving this size on a Mac is unmeasured upstream"
+        }
         if !model.fitsInRAM {
-            help += " — this Mac has \(KevModel.physicalRAMGB) GB"
+            help += ". This Mac has \(KevModel.physicalRAMGB) GB: the model will load but serve very slowly by swapping"
         }
         return help
     }
