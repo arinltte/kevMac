@@ -2,7 +2,7 @@ import Foundation
 
 /// The supported kev checkpoints — the Kev 1.0 family (0.8B / 4B / 9B / 27B), pinned to the
 /// upstream `@v1.0` Hub tags. The Qwen3-0.6B the app originally shipped with was retired
-/// upstream to "previous generation" and is removed from kevMac entirely (v0.3.1): it is no
+/// upstream to "previous generation" and is removed from kevMac entirely (v0.3.0): it is no
 /// longer selectable, and leftover caches from older installs are cleaned up automatically.
 /// Selection is dynamic: the engine serves whichever model is selected, and only that
 /// model's weights are downloaded.

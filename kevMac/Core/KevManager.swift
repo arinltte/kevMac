@@ -413,11 +413,11 @@ class KevManager: ObservableObject {
         refreshStorageInfo()
     }
 
-    // MARK: - Retired-model cleanup (kev-0.6b was removed from the app in v0.3.1)
+    // MARK: - Retired-model cleanup (kev-0.6b was removed from the app in v0.3.0)
 
     private static let retired06bCleanupKey = "retiredKev06bCacheCleaned"
 
-    /// One-time removal of the retired kev-0.6b's weights. v0.3.1 dropped the model from the
+    /// One-time removal of the retired kev-0.6b's weights. v0.3.0 dropped the model from the
     /// picker, so a cache left by older installs is dead weight the storage manager can no
     /// longer see — this clears it through the hub's own `hf cache rm` (shared-blob
     /// refcounts respected), falling back to deleting the app-owned cache directories.
